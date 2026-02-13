@@ -1,169 +1,106 @@
-import { NextRequest } from 'next/server';
-import { prisma } from '@/lib/db';
-import { generateSlug, validateAlias } from '@/lib/slug';
-import { validateUrl } from '@/lib/url-validator';
-import { requireApiKey } from '@/lib/auth';
+import { NextRequest, NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+import { withAuth } from '@/lib/auth';
+import { checkRateLimit, applyRateLimitHeaders, rateLimitExceeded } from '@/lib/rate-limit';
+import { nanoid } from 'nanoid';
 
-const MAX_SLUG_RETRIES = 5;
-
-/**
- * POST /api/links — Create a new short link.
- * Body: { url: string, alias?: string, expiresAt?: string }
- */
-export async function POST(request: NextRequest) {
-  const auth = requireApiKey(request);
-  if ('error' in auth) return auth.error;
-
-  let body: { url?: string; alias?: string; expiresAt?: string };
-  try {
-    body = await request.json();
-  } catch {
-    return Response.json({ error: 'Invalid JSON body.' }, { status: 400 });
-  }
-
-  // Validate URL
-  if (!body.url) {
-    return Response.json({ error: 'Missing required field: url' }, { status: 400 });
-  }
-
-  const urlCheck = validateUrl(body.url);
-  if (!urlCheck.valid) {
-    return Response.json({ error: urlCheck.error }, { status: 400 });
-  }
-
-  // Validate expiration
-  let expiresAt: Date | null = null;
-  if (body.expiresAt) {
-    expiresAt = new Date(body.expiresAt);
-    if (isNaN(expiresAt.getTime())) {
-      return Response.json({ error: 'Invalid expiresAt date.' }, { status: 400 });
-    }
-    if (expiresAt <= new Date()) {
-      return Response.json({ error: 'expiresAt must be in the future.' }, { status: 400 });
-    }
-  }
-
-  // Determine slug
-  let slug: string;
-  let customAlias = false;
-
-  if (body.alias) {
-    const aliasCheck = validateAlias(body.alias);
-    if (!aliasCheck.valid) {
-      return Response.json({ error: aliasCheck.error }, { status: 400 });
-    }
-
-    // Check uniqueness
-    const existing = await prisma.link.findUnique({ where: { slug: body.alias } });
-    if (existing) {
-      return Response.json(
-        { error: `Alias "${body.alias}" is already taken.` },
-        { status: 409 }
-      );
-    }
-
-    slug = body.alias;
-    customAlias = true;
-  } else {
-    // Generate random slug with retry
-    slug = '';
-    for (let i = 0; i < MAX_SLUG_RETRIES; i++) {
-      const candidate = generateSlug();
-      const existing = await prisma.link.findUnique({ where: { slug: candidate } });
-      if (!existing) {
-        slug = candidate;
-        break;
-      }
-    }
-    if (!slug) {
-      return Response.json(
-        { error: 'Failed to generate unique slug. Please try again.' },
-        { status: 500 }
-      );
-    }
-  }
-
-  // Create link
-  const link = await prisma.link.create({
-    data: {
-      slug,
-      destinationUrl: urlCheck.normalized!,
-      customAlias,
-      expiresAt,
-      apiKeyId: auth.key,
-    },
-  });
-
-  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || request.nextUrl.origin;
-
-  return Response.json(
-    {
-      id: link.id,
-      shortUrl: `${baseUrl}/${link.slug}`,
-      slug: link.slug,
-      destinationUrl: link.destinationUrl,
-      customAlias: link.customAlias,
-      expiresAt: link.expiresAt,
-      createdAt: link.createdAt,
-    },
-    { status: 201 }
-  );
-}
+const RATE_LIMIT = 100;
+const RATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
 /**
- * GET /api/links — List links for the authenticated API key.
- * Query: ?page=1&limit=20&sort=createdAt|clicks&q=search
+ * GET /api/links — List all links (auth required)
  */
-export async function GET(request: NextRequest) {
-  const auth = requireApiKey(request);
-  if ('error' in auth) return auth.error;
-
-  const { searchParams } = request.nextUrl;
+export const GET = withAuth(async (request: NextRequest) => {
+  const { searchParams } = new URL(request.url);
   const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10));
   const limit = Math.min(100, Math.max(1, parseInt(searchParams.get('limit') || '20', 10)));
-  const sort = searchParams.get('sort') === 'clicks' ? 'clickCount' : 'createdAt';
-  const q = searchParams.get('q') || '';
+  const search = searchParams.get('search') || '';
 
-  const where = {
-    apiKeyId: auth.key,
-    ...(q
-      ? {
-          OR: [
-            { slug: { contains: q } },
-            { destinationUrl: { contains: q } },
-          ],
-        }
-      : {}),
-  };
+  const where = search
+    ? {
+        OR: [
+          { slug: { contains: search, mode: 'insensitive' as const } },
+          { url: { contains: search, mode: 'insensitive' as const } },
+        ],
+      }
+    : {};
 
   const [links, total] = await Promise.all([
     prisma.link.findMany({
       where,
-      orderBy: { [sort]: 'desc' },
+      orderBy: { createdAt: 'desc' },
       skip: (page - 1) * limit,
       take: limit,
+      include: { _count: { select: { clicks: true } } },
     }),
     prisma.link.count({ where }),
   ]);
 
-  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || request.nextUrl.origin;
-
-  return Response.json({
-    data: links.map((link) => ({
-      id: link.id,
-      shortUrl: `${baseUrl}/${link.slug}`,
-      slug: link.slug,
-      destinationUrl: link.destinationUrl,
-      customAlias: link.customAlias,
-      clickCount: link.clickCount,
-      createdAt: link.createdAt,
-      expiresAt: link.expiresAt,
+  return NextResponse.json({
+    links: links.map((link) => ({
+      ...link,
+      clicks: link._count.clicks,
+      _count: undefined,
     })),
-    pagination: {
-      page,
-      limit,
-      total,
-      totalPages: Math.ceil(total / limit),
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+/**
+ * POST /api/links — Create a short link (auth + rate limit)
+ */
+export const POST = withAuth(async (request: NextRequest) => {
+  const keyId = request.headers.get('x-key-id') || 'unknown';
+
+  // Rate limit check
+  const rl = await checkRateLimit(keyId, 'create-link', RATE_LIMIT, RATE_WINDOW_MS);
+  if (!rl.allowed) {
+    return rateLimitExceeded(RATE_LIMIT, rl);
+  }
+
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+
+  const { url, slug: customSlug, expiresAt } = body;
+
+  if (!url || typeof url !== 'string') {
+    return NextResponse.json({ error: 'url is required' }, { status: 400 });
+  }
+
+  try {
+    new URL(url);
+  } catch {
+    return NextResponse.json({ error: 'Invalid URL format' }, { status: 400 });
+  }
+
+  const slug = customSlug || nanoid(7);
+
+  // Check for slug collision
+  const existing = await prisma.link.findUnique({ where: { slug } });
+  if (existing) {
+    return NextResponse.json({ error: 'Slug already taken' }, { status: 409 });
+  }
+
+  const link = await prisma.link.create({
+    data: {
+      url,
+      slug,
+      expiresAt: expiresAt ? new Date(expiresAt) : null,
     },
   });
-}
+
+  const baseUrl = process.env.BASE_URL || 'http://localhost:3000';
+  const response = NextResponse.json(
+    {
+      ...link,
+      shortUrl: `${baseUrl}/${link.slug}`,
+    },
+    { status: 201 }
+  );
+
+  return applyRateLimitHeaders(response, RATE_LIMIT, rl);
+});

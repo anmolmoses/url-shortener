@@ -1,29 +1,58 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 
-/**
- * Extract and validate API key from request headers.
- * Returns the API key string or null if missing/invalid.
- */
-export function getApiKey(request: NextRequest): string | null {
-  const key = request.headers.get('x-api-key');
-  if (!key || key.trim().length === 0) return null;
-  return key.trim();
+interface AuthResult {
+  valid: boolean;
+  keyId: string;
 }
 
 /**
- * Require API key — returns error Response if missing, or the key string.
+ * Validate an API key from the X-API-Key header.
+ * For MVP: checks against API_KEYS env var (comma-separated).
  */
-export function requireApiKey(
-  request: NextRequest
-): { key: string } | { error: Response } {
-  const key = getApiKey(request);
-  if (!key) {
-    return {
-      error: Response.json(
-        { error: 'Missing or invalid x-api-key header.' },
-        { status: 401 }
-      ),
-    };
+export function validateApiKey(request: NextRequest): AuthResult {
+  const apiKey = request.headers.get('x-api-key');
+
+  if (!apiKey) {
+    return { valid: false, keyId: '' };
   }
-  return { key };
+
+  const validKeys = (process.env.API_KEYS || '')
+    .split(',')
+    .map((k) => k.trim())
+    .filter(Boolean);
+
+  if (validKeys.length === 0) {
+    // No keys configured — allow all (dev mode)
+    return { valid: true, keyId: 'dev' };
+  }
+
+  const index = validKeys.indexOf(apiKey);
+  if (index >= 0) {
+    return { valid: true, keyId: `key-${index}` };
+  }
+
+  return { valid: false, keyId: '' };
+}
+
+/**
+ * Middleware wrapper that enforces API key auth on a route handler.
+ */
+export function withAuth(
+  handler: (request: NextRequest, context?: any) => Promise<NextResponse>
+) {
+  return async (request: NextRequest, context?: any): Promise<NextResponse> => {
+    const auth = validateApiKey(request);
+
+    if (!auth.valid) {
+      return NextResponse.json(
+        { error: 'Unauthorized', message: 'Missing or invalid API key. Provide a valid X-API-Key header.' },
+        { status: 401 }
+      );
+    }
+
+    // Attach keyId to headers for downstream use
+    request.headers.set('x-key-id', auth.keyId);
+
+    return handler(request, context);
+  };
 }
